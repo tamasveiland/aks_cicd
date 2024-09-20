@@ -1,0 +1,157 @@
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - 'src/*'
+      - '.pipelines/deploy-aks-app.yml'
+
+variables:
+  vmImageName: 'ubuntu-latest'
+  azureServiceConnection: '<service_connection>'
+  acr_name: '<Azure_container_registry>'
+  aks_cluster: 'aks-basic'
+  resource_group: 'rg-aks-bicep'
+  major_version: '1'
+  minor_version: '4'
+  patch_version: '7'
+
+name: $(major_version).$(minor_version).$(patch_version).$(Rev:r)
+
+pool:
+  vmImage: $(vmImageName)
+
+stages:
+- stage: DeploySampleApp
+  displayName: Deploy Sample App
+  dependsOn: []
+  jobs:
+  - deployment: DeploySample
+    displayName: Deploy App
+    environment: infra
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+            - checkout: self
+
+            - task: KubectlInstaller@0
+              inputs:
+                kubectlVersion: '1.27.9'
+            
+            - task: AzureCLI@2
+              displayName: Build sample app
+              condition: false
+              inputs:
+                azureSubscription: $(azureServiceConnection)
+                scriptType: 'bash'
+                scriptLocation: 'inlineScript'
+                inlineScript: 'docker build -f Dockerfile -t $(acr_name)/mymicroservice:$(build.buildnumber) .'
+                workingDirectory: 'src/webapi'
+
+            - task: AzureCLI@2
+              displayName: Push sample app to ACR
+              condition: false
+              inputs:
+                azureSubscription: $(azureServiceConnection)
+                scriptType: 'bash'
+                scriptLocation: 'inlineScript'
+                inlineScript: |
+                  az acr login --name $(acr_name)
+                  docker push $(acr_name)/mymicroservice:$(build.buildnumber)
+                workingDirectory: 'src/webapi'
+
+            - task: AzureCLI@2
+              displayName: Install kubelogin
+              enabled: true
+              inputs:
+                azureSubscription: '$(azureServiceConnection)'
+                scriptType: 'bash'
+                scriptLocation: 'inlineScript'
+                inlineScript: |
+                  az aks install-cli
+                  export PATH="/usr/local/bin:$PATH"
+
+                  az aks get-credentials --name $(aks_cluster) --resource-group $(resource_group)
+
+                  export KUBECONFIG=/home/vsts/.kube/config
+                  #export KUBECONFIG=~/.kube/config
+                  kubectl config view
+                  
+                  kubelogin convert-kubeconfig -l spn --client-id ${ARM_CLIENT_ID} --client-secret ${ARM_CLIENT_SECRET} # --use-azurerm-env-vars --client-secret ""
+
+                  export AZURE_CLIENT_ID=$servicePrincipalId
+                  export AZURE_CLIENT_SECRET=$servicePrincipalKey
+                  
+                  kubectl get nodes
+                addSpnToEnvironment: true
+                workingDirectory: 'src/webapi'
+
+            - task: AzureCLI@2
+              displayName: Get credentials for AKS cluster
+              condition: false
+              inputs:
+                azureSubscription: $(azureServiceConnection)
+                scriptType: 'bash'
+                scriptLocation: 'inlineScript'
+                inlineScript: |
+                  az aks get-credentials --name $(aks_cluster) --resource-group $(resource_group)
+                workingDirectory: 'src/webapi'
+
+            - task: helm@1
+              displayName: 'Install app via Helm'
+              condition: false
+              # env:
+              #   clientSecret: $servicePrincipalKey
+              inputs:
+                subCommand: 'upgrade'
+                arguments: '--install mymicroserviceapp . --namespace=local --set mymicroserviceapp.image.tag="$(build.buildnumber)"'
+
+            - task: HelmInstaller@1
+              displayName: 'Install Helm tool'
+              inputs:
+                helmVersionToInstall: 'latest'
+
+            - task: AzureCLI@2
+              displayName: 'Install app via Helm'
+              condition: false
+              env:
+                clientSecret: $(servicePrincipalKey)
+              inputs:
+                azureSubscription: $(azureServiceConnection)
+                scriptType: 'bash'
+                scriptLocation: 'inlineScript'
+                inlineScript: |
+                  helm upgrade --install mymicroserviceapp . --namespace=local --set mymicroserviceapp.image.tag="$(build.buildnumber)"
+                workingDirectory: 'src/webapi'
+                addSpnToEnvironment: true
+
+            - task: Kubernetes@1
+              displayName: Create demo namespace
+              enabled: false
+              inputs:
+                connectionType: 'Azure Resource Manager'
+                azureSubscriptionEndpoint: '$(azureServiceConnection)'
+                azureResourceGroup: '$(resource_group)'
+                kubernetesCluster: '$(aks_cluster)'
+                command: 'create'
+                arguments: 'namespace demo'
+                secretType: 'dockerRegistry'
+                containerRegistryType: 'Azure Container Registry'
+
+            # Package and deploy Helm charts v0
+            # Deploy, configure, update a Kubernetes cluster in Azure Container Service by running helm commands.
+            - task: HelmDeploy@0
+              displayName: 'Install app via Helm'
+              inputs:
+                connectionType: 'Azure Resource Manager' # 'Azure Resource Manager' | 'Kubernetes Service Connection' | 'None'. Required when command != logout && command != package && command != save. Connection Type. Default: Azure Resource Manager.
+                azureSubscription: $(azureServiceConnection) # string. Alias: azureSubscriptionEndpoint. Required when connectionType = Azure Resource Manager && command != logout && command != package && command != save. Azure subscription. 
+                azureResourceGroup: $(resource_group) # string. Required when connectionType = Azure Resource Manager && command != logout && command != package && command != save. Resource group. 
+                kubernetesCluster: $(aks_cluster) # string. Required when connectionType = Azure Resource Manager && command != logout && command != package && command != save. Kubernetes cluster. 
+                useClusterAdmin: false # boolean. Optional. Use when connectionType = Azure Resource Manager && command != logout && command != package && command != save. Use cluster admin credentials. Default: false.
+                command: 'upgrade' # 'create' | 'delete' | 'expose' | 'get' | 'init' | 'install' | 'login' | 'logout' | 'ls' | 'package' | 'rollback' | 'save' | 'upgrade' | 'uninstall'. Required. Command. Default: ls.
+                chartType: 'FilePath' # 'Name' | 'FilePath'. Required when command == install || command == upgrade. Chart Type. Default: Name.
+                chartPath: 'src/charts/mymicroserviceapp' # string. Required when chartType == FilePath || command == package. Chart Path. 
+                arguments: '--namespace=demo --set mymicroserviceapp.image.tag="$(build.buildnumber)"' # string. Optional. Use when command != login && command != logout. Arguments. 
+

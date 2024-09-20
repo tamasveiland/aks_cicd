@@ -1,0 +1,51 @@
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: bookinfo-gateway-external
+  labels:
+    istio.io/rev: asm-1-19
+  annotations:
+    service.beta.kubernetes.io/azure-dns-label-name: "bookinfo-tv22"
+    service.beta.kubernetes.io/azure-load-balancer-health-probe-request-path: "/healthz/ready"
+    service.beta.kubernetes.io/port_80_health-probe_protocol: http
+    service.beta.kubernetes.io/port_80_health-probe_port: "15021"
+    service.beta.kubernetes.io/port_443_health-probe_protocol: http
+    service.beta.kubernetes.io/port_443_health-probe_port: "15021"
+spec:
+  gatewayClassName: istio
+  listeners:
+  - name: http
+    protocol: HTTP
+    port: 80
+    allowedRoutes:
+      namespaces:
+        from: All
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: bookinfo-gateway-external
+spec:
+  parentRefs:
+  - name: bookinfo-gateway-external
+  rules:
+  - matches:
+    - path:
+        type: Exact
+        value: /productpage
+    - path:
+        type: PathPrefix
+        value: /static
+    - path:
+        type: Exact
+        value: /login
+    - path:
+        type: Exact
+        value: /logout
+    - path:
+        type: PathPrefix
+        value: /api/v1/products
+    backendRefs:
+    - name: bookinfo/productpage
+      port: 9080

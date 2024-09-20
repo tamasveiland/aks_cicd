@@ -1,0 +1,202 @@
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - 'iac/*'
+
+name: $(Date:yyyyMMdd)$(Rev:.r)
+
+variables:
+  vmImageName: 'ubuntu-latest'
+
+  azureServiceConnection: 'ME-MngEnvMCAP362767-taveilan-1'
+  resourceGroupName: 'rg-aks-bicep'
+  clusterName: 'aks-advanced'
+  location: 'swedencentral'
+  templateFile: 'main.bicep'
+  templateParams: 'main.bicepparam'
+  deployAks: true
+  deploySampleApp: false
+  ingress_domain: ''
+
+pool:
+  vmImage: $(vmImageName)
+
+stages:
+
+- stage: Lint
+  condition: and(succeeded(), eq(variables.deployAks, true))
+  jobs: 
+  - job: LintCode
+    displayName: Lint Code
+    steps:
+      - script: |
+          az bicep build --file $(templateFile)
+        name: LintBicepCode
+        displayName: Run Bicep linter
+        workingDirectory: 'iac'
+
+- stage: Validate
+  condition: and(succeeded(), eq(variables.deployAks, true))
+  jobs:
+  - job: Validate
+    steps:
+      - task: AzureResourceManagerTemplateDeployment@3
+        name: RunPreflightValidation
+        displayName: Run preflight validation
+        inputs:
+          connectedServiceName: '$(azureServiceConnection)'
+          location: $(location)
+          deploymentMode: Validation
+          resourceGroupName: $(resourceGroupName)
+          csmFile: iac/main.bicep
+          csmParametersFile: 'iac/main.bicepparam'
+
+- stage: Preview
+  condition: and(succeeded(), eq(variables.deployAks, true))
+  jobs: 
+  - job: Preview
+    steps:
+    - task: AzureCLI@2
+      displayName: Change list generation
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          az deployment group what-if \
+            --resource-group $(resourceGroupName) \
+            --template-file $(templateFile) \
+            --parameters $(templateParams)
+        workingDirectory: iac
+
+- stage: Deploy
+  condition: and(succeeded(), eq(variables.deployAks, true))
+  jobs:
+  - deployment: DeployInfra
+    displayName: Deploy infrastructure
+    environment: infra
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+            - checkout: self
+            - task: AzureCLI@2
+              displayName: Deploy infrastructure
+              inputs:
+                azureSubscription: '$(azureServiceConnection)'
+                scriptType: 'bash'
+                scriptLocation: 'inlineScript'
+                inlineScript: |
+                  az --version
+                  az group create --name $(resourceGroupName) --location $(location)
+                  az deployment group create \
+                    --resource-group $(resourceGroupName) \
+                    --template-file $(templateFile) \
+                    --parameters $(templateParams) \
+                    --mode Complete
+                workingDirectory: 'iac'
+                failOnStandardError: false
+
+- stage: DeploySampleApp
+  displayName: Deploy Sample App
+  condition: and(succeeded(), eq(variables.deploySampleApp, true))
+  dependsOn: []
+  jobs:
+  - deployment: DeploySample
+    displayName: Deploy Book Info App
+    environment: infra
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+            - checkout: self
+
+            - task: KubectlInstaller@0
+              inputs:
+                kubectlVersion: '1.27.9'
+
+            - task: AzureCLI@2
+              displayName: Set Path
+              enabled: false
+              inputs:
+                azureSubscription: '$(azureServiceConnection)'
+                scriptType: 'bash'
+                scriptLocation: 'inlineScript'
+                inlineScript: |
+                  echo "PATH=\$PATH:/usr/local/bin" >> ~/.bashrc
+                  echo $PATH
+                workingDirectory: 'iac'
+                failOnStandardError: false
+
+            - task: AzureCLI@2
+              displayName: Download bookinfo.yaml manifest
+              enabled: true
+              inputs:
+                azureSubscription: '$(azureServiceConnection)'
+                scriptType: 'bash'
+                scriptLocation: 'inlineScript'
+                inlineScript: |
+                  # export PATH="$HOME/bin:$PATH"
+                  # export PATH="/usr/local/bin:$PATH"
+                  # echo "PATH=\$PATH:/usr/local/bin" >> ~/.bashrc
+                  # echo $PATH
+                  # export KUBECONFIG=$HOME/.kube/config
+                  # echo "  "
+                  # echo "  "
+                  # echo "Checking kubectl version..."
+                  # kubectl version
+                  echo "  "
+                  echo "  "
+                  echo "Downloading BookInfo manifest..."
+                  wget "https://raw.githubusercontent.com/istio/istio/release-1.19/samples/bookinfo/platform/kube/bookinfo.yaml"
+                  echo "  "
+                  echo "  "
+                  # az aks get-credentials --resource-group $(resourceGroupName) --name aks-aks-advanced-istio --admin
+                  # # brew install Azure/kubelogin/kubelogin
+                  az aks install-cli
+                  # kubectl apply -f https://raw.githubusercontent.com/istio/istio/release-1.19/samples/bookinfo/platform/kube/bookinfo.yaml
+                workingDirectory: 'iac'
+                failOnStandardError: false
+
+            - task: AzureCLI@2
+              displayName: Install kubelogin
+              enabled: true
+              inputs:
+                azureSubscription: '$(azureServiceConnection)'
+                scriptType: 'bash'
+                scriptLocation: 'inlineScript'
+                inlineScript: |
+                  az aks install-cli
+                workingDirectory: 'iac'
+                failOnStandardError: false
+
+            - task: Kubernetes@1
+              displayName: Create bookinfo namespace
+              enabled: true
+              inputs:
+                connectionType: 'Azure Resource Manager'
+                azureSubscriptionEndpoint: '$(azureServiceConnection)'
+                azureResourceGroup: '$(resourceGroupName)'
+                kubernetesCluster: 'aks-advanced'
+                command: 'create'
+                arguments: 'namespace bookinfo'
+                secretType: 'dockerRegistry'
+                containerRegistryType: 'Azure Container Registry'
+
+            - task: KubernetesManifest@1
+              displayName: 'Deploy BookInfo App'
+              inputs:
+                action: 'deploy'
+                connectionType: 'azureResourceManager'
+                azureSubscriptionConnection: '$(azureServiceConnection)'
+                azureResourceGroup: '$(resourceGroupName)'
+                kubernetesCluster: 'aks-advanced'
+                manifests: 'iac/bookinfo.yaml'
+                useClusterAdmin: false
+                namespace: 'bookinfo'
+
+
+
